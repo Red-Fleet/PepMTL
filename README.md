@@ -66,3 +66,5 @@ Pre-trained model weights for the full PepMTL architecture have been made public
 The primary dataset (cleaned_clustered_dataset.json) is included in this repository. This file contains the peptide sequences and their corresponding functional classes, pre-clustered using CD-HIT at an 80% identity threshold to eliminate sequence homology leakage between training and testing partitions.
 
 The benchmark datasets are sourced from their respective original publications and included in the benchmark/ subdirectories for ease of reproducibility.
+
+zenodo: 🔗https://doi.org/10.5281/zenodo.19749666
