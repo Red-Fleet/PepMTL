@@ -59,7 +59,7 @@ python test_results.py
 
 💾 Pre-trained Weights
 Pre-trained model weights for the full PepMTL architecture have been made publicly available. You can download the .pt files 
-🔗 https://drive.google.com/file/d/1D3L4BrSx1_pL3tJ4Lq0RH55tSQGC2aGe/view?usp=sharing
+🔗 https://drive.google.com/drive/folders/16eGJxFZI1x3kYpHA7byTRqxfa0NIJFsJ?usp=sharing
 
 
 📊 Data Availability
