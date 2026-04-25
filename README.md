@@ -21,6 +21,9 @@ To ensure realistic generalization and prevent sequence homology leakage, the pr
 │       └── ToxPre.ipynb              # 10-fold CV evaluation script
 ├── classification_model.ipynb        # Main PepMTL architecture, training, and evaluation pipeline
 ├── cleaned_clustered_dataset.json    # Primary multi-label dataset (CD-HIT 80% clustered)
+├── predict.py                        # Given peptides this file loads the model and predict the peptide classes 
+├── test_results.py                   # file to generate test results present in paper
+├── model.py                          # contains the model class
 ├── LICENSE                           # Open-source license
 └── README.md                         # This file
 ```
@@ -41,6 +44,18 @@ To reproduce the benchmarking results presented in the manuscript, navigate to t
 Open benchmark/ToxPre/ToxPre.ipynb or benchmark/ToxMSRC/ToxMsrc.ipynb to run the 10-fold cross-validation toxicity evaluations.
 
 Open benchmark/MCMEPP/MCMFPP.ipynb to run the paper-style multi-label evaluation against the MCMFPP framework.
+
+3. Predicting New Peptides
+To predict the functional classes of new peptide sequences, use the `predict.py` script. This script loads the pre-trained model and evaluates the given peptides.
+```bash
+python predict.py
+```
+
+4. Generating Test Results
+To reproduce the exact test set metrics and evaluate the model's performance as presented in the paper, run:
+```bash
+python test_results.py
+```
 
 💾 Pre-trained Weights
 Pre-trained model weights for the full PepMTL architecture have been made publicly available. You can download the .pt files 
