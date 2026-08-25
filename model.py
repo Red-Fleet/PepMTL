@@ -35,10 +35,6 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from transformers import AutoModelForMaskedLM
 
-# =====================================================================
-# Model v19 (Lite): Sequence-Level Cross-Attention + Task Query Decoder
-# Parameter Count: ~19.6 Million
-# =====================================================================
 
 class ESM2_Encoder(nn.Module):
     def __init__(self, model_name, trainable=True, unfreeze_last_n=0):
@@ -57,41 +53,306 @@ class ESM2_Encoder(nn.Module):
         return self.esm_mlm.esm(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
 
 class SEBlock(nn.Module):
+    """
+    Mask-aware Squeeze-and-Excitation block.
+
+    Input:
+        x        : [B, C, L]
+        seq_mask : [B, L], 1 for valid tokens, 0 for PAD
+
+    The channel descriptor is computed using only valid sequence positions.
+    """
+
     def __init__(self, channels, reduction=4):
         super().__init__()
+
+        hidden = max(channels // reduction, 1)
+
         self.fc = nn.Sequential(
-            nn.Linear(channels, channels // reduction), nn.ReLU(),
-            nn.Linear(channels // reduction, channels), nn.Sigmoid()
+            nn.Linear(channels, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, channels),
+            nn.Sigmoid()
         )
-    def forward(self, x):
-        w = x.mean(dim=-1)
-        return x * self.fc(w).unsqueeze(-1)
+
+    def forward(self, x, seq_mask):
+        # [B, L] -> [B, 1, L]
+        mask = seq_mask.unsqueeze(1).to(dtype=x.dtype)
+
+        # Remove PAD contributions
+        x_masked = x * mask
+
+        # Number of valid positions per sequence
+        lengths = seq_mask.sum(
+            dim=1,
+            keepdim=True
+        ).clamp_min(1).to(dtype=x.dtype)
+
+        # Masked global average pooling over sequence dimension
+        # [B, C, L] -> [B, C]
+        channel_descriptor = (
+            x_masked.sum(dim=-1) / lengths
+        )
+
+        # Channel-wise gates
+        gates = self.fc(channel_descriptor).unsqueeze(-1)
+
+        # Apply channel recalibration
+        return x * gates
+
+class ConvBlock(nn.Module):
+    """
+    Mask-aware two-layer 1D convolution block.
+
+    Uses LayerNorm instead of BatchNorm so that padded positions
+    do not participate in batch/sequence normalization statistics.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super().__init__()
+
+        self.conv1 = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            bias=False
+        )
+
+        self.norm1 = nn.LayerNorm(out_channels)
+
+        self.conv2 = nn.Conv1d(
+            out_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            bias=False
+        )
+
+        self.norm2 = nn.LayerNorm(out_channels)
+
+    @staticmethod
+    def apply_layernorm(x, norm):
+        """
+        Conv output: [B, C, L]
+        LayerNorm expects normalized dimension at the end.
+        """
+        x = x.transpose(1, 2)      # [B, L, C]
+        x = norm(x)
+        x = x.transpose(1, 2)      # [B, C, L]
+        return x
+
+    def forward(self, x, mask):
+        """
+        x    : [B, C, L]
+        mask : [B, 1, L]
+        """
+        # First convolution
+        y = self.conv1(x)
+        y = self.apply_layernorm(
+            y,
+            self.norm1
+        )
+
+        y = F.gelu(y)
+
+        # Explicitly remove PAD activations
+        y = y * mask
+
+        # Second convolution
+        y = self.conv2(y)
+
+        y = self.apply_layernorm(
+            y,
+            self.norm2
+        )
+
+        y = F.gelu(y)
+
+        # Explicitly remove PAD activations again
+        y = y * mask
+
+        return y
 
 class EnhancedCNN1D(nn.Module):
-    # REDUCED conv_dim from 256 to 128
-    def __init__(self, vocab_size=33, embed_dim=128, conv_dim=128):
-        super().__init__()
-        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        self.branches = nn.ModuleList()
-        for k in [3, 5, 7]:
-            self.branches.append(nn.Sequential(
-                nn.Conv1d(embed_dim, conv_dim, k, padding=k//2),
-                nn.BatchNorm1d(conv_dim), nn.GELU(),
-                nn.Conv1d(conv_dim, conv_dim, k, padding=k//2),
-                nn.BatchNorm1d(conv_dim), nn.GELU(),
-            ))
-        self.res_proj = nn.Conv1d(embed_dim, conv_dim, 1)
-        self.se = SEBlock(conv_dim * 3)
-        self.dropout = nn.Dropout(0.2)
-        self.hidden_size = conv_dim * 3 * 2  # Now 768 instead of 1536
+    """
+    Mask-aware multi-scale CNN for peptide/protein sequences.
 
-    def forward(self, x):
-        x = self.embed(x).transpose(1, 2)
+    Branches:
+        kernel 3 -> effective receptive field 5
+        kernel 5 -> effective receptive field 9
+        kernel 7 -> effective receptive field 13
+
+    Each branch contains two convolutional layers.
+
+    Output:
+        [B, 2 * 3 * conv_dim]
+
+    For conv_dim=128:
+        output = [B, 768]
+    """
+
+    def __init__(
+        self,
+        vocab_size=33,
+        embed_dim=128,
+        conv_dim=128
+    ):
+        super().__init__()
+
+
+        # Token embedding
+        self.embed = nn.Embedding(
+            num_embeddings=vocab_size,
+            embedding_dim=embed_dim,
+            padding_idx=1 # ESM TOKENIZER
+        )
+
+        # Multi-scale CNN branches
+        self.branches = nn.ModuleList([
+            ConvBlock(
+                in_channels=embed_dim,
+                out_channels=conv_dim,
+                kernel_size=k
+            )
+            for k in [3, 5, 7]
+        ])
+
+        # Residual projection
+        self.res_proj = nn.Conv1d(
+            embed_dim,
+            conv_dim,
+            kernel_size=1,
+            bias=False
+        )
+
+        # Squeeze-and-Excitation
+        self.se = SEBlock(
+            channels=conv_dim * 3,
+            reduction=4
+        )
+
+        self.dropout = nn.Dropout(0.2)
+
+        # Three branches × conv_dim channels
+        # Max pooling + mean pooling
+        self.hidden_size = conv_dim * 3 * 2
+
+    def forward(self, x, seq_mask):
+        """
+        Args:
+            x:
+                [B, L] token IDs
+
+            seq_mask:
+                [B, L]
+                1 = valid token
+                0 = PAD
+        Returns:
+            CNN feature vector:
+                [B, hidden_size]
+
+        For conv_dim=128:
+            [B, 768]
+        """
+
+
+        # Validate mask
+
+
+        if seq_mask is None:
+            raise ValueError(
+                "seq_mask must be provided to EnhancedCNN1D. "
+                "CNN padding masking must never be bypassed."
+            )
+        # Embedding
+        # [B, L] -> [B, L, embed_dim]
+        x = self.embed(x)
+
+        # [B, L, embed_dim] -> [B, embed_dim, L]
+        x = x.transpose(1, 2)
+
+        # [B, L] -> [B, 1, L]
+        mask = seq_mask.unsqueeze(1).to(dtype=x.dtype)
+
+        # Explicitly zero PAD embeddings
+        x = x * mask
+
+        # Residual pathway
         res = self.res_proj(x)
-        outs = [branch(x) + res for branch in self.branches]
-        combined = torch.cat(outs, dim=1)
-        combined = self.se(combined)
-        return self.dropout(torch.cat([combined.max(dim=-1).values, combined.mean(dim=-1)], dim=1))
+
+        # Remove PAD activations
+        res = res * mask
+
+        # Multi-scale branches
+        outs = []
+
+        for branch in self.branches:
+            y = branch(x, mask)
+            # Residual connection
+            y = y + res
+            # Guarantee PAD = 0 after residual addition
+            y = y * mask
+            outs.append(y)
+
+        # Concatenate branches
+        # [B, 128*3, L]
+        combined = torch.cat(
+            outs,
+            dim=1
+        )
+
+        # Guarantee no PAD signal
+        combined = combined * mask
+
+        # Mask-aware SE
+        combined = self.se(
+            combined,
+            seq_mask
+        )
+
+        # SE can theoretically produce nonzero values
+        # at PAD positions, so mask once more.
+        combined = combined * mask
+
+        # MASKED GLOBAL MAX POOLING
+        # PAD cannot become the maximum.
+        combined_for_max = combined.masked_fill(
+            seq_mask.unsqueeze(1) == 0,
+            torch.finfo(combined.dtype).min
+        )
+
+        max_pooled = combined_for_max.max(
+            dim=-1
+        ).values
+
+
+        # MASKED GLOBAL MEAN POOLING
+        combined_for_mean = combined * mask
+
+        # Actual number of valid tokens
+        lengths = seq_mask.sum(
+            dim=1,
+            keepdim=True
+        ).clamp_min(1).to(
+            dtype=combined.dtype
+        )
+
+        mean_pooled = (
+            combined_for_mean.sum(dim=-1)
+            / lengths
+        )
+
+        # FINAL REPRESENTATION
+        pooled = torch.cat(
+            [
+                max_pooled,
+                mean_pooled
+            ],
+            dim=1
+        )
+
+        return self.dropout(pooled)
 
 
 class MultiHeadAttentionPool(nn.Module):
@@ -221,7 +482,7 @@ class PeptideNetwork(nn.Module):
     def _extract_features(self, seq_input, seq_mask):
         esm6_a_seq = self.esm_t6_a(seq_input, seq_mask)       
         esm6_b_seq = self.esm_t6_b(seq_input, seq_mask)     
-        cnn_feat = self.cnn(seq_input)                          
+        cnn_feat = self.cnn(seq_input, seq_mask)                            
 
         t6_a = self.proj_t6_a(esm6_a_seq)       
         t6_b = self.proj_t6_b(esm6_b_seq)    
@@ -247,6 +508,48 @@ class PeptideNetwork(nn.Module):
         
         return binary_features, torch.cat([fusion, binary_features], dim=1)
     
+    def _binary_classify(self, binary_features):
+        
+        binary_logits = self.binary_classifier(binary_features)
+
+        return binary_logits
+
+    def _classify(self, final_fusion):
+        B = final_fusion.size(0)
+        memory = self.memory_proj(final_fusion).view(B, self.n_memory_tokens, self.task_dim)
+        tgt = self.task_queries.weight.unsqueeze(0).expand(B, -1, -1)
+        decoded = self.task_decoder(tgt, memory)
+        logits = torch.cat([self.task_classifiers[i](decoded[:, i, :])
+                           for i in range(self.num_classes)], dim=1)
+        return logits
+
+    def forward(self, seq_input, seq_mask, mask_tokens=False):
+        if mask_tokens and self.training:
+            seq_input = self._mask_tokens(seq_input, seq_mask)
+        
+        binary_features, combined_features = self._extract_features(seq_input, seq_mask)
+        
+
+        return self._binary_classify(binary_features), self._classify(combined_features)
+
+
+    def ortho_loss(self):
+        return (self.pool_t6_a.orthogonality_loss() +
+                self.pool_t6_b.orthogonality_loss() 
+                ) / 2
+    
+    def get_features(self, seq_input, seq_mask, mask_tokens=False):
+        if mask_tokens and self.training:
+            seq_input = self._mask_tokens(seq_input, seq_mask)
+        return self._extract_features(seq_input, seq_mask)
+
+    def multi_classify(self, combined):
+        return self._classify(combined)
+    
+    def binary_classify(self, binary_features):
+        return self._binary_classify(binary_features)
+
+
     def _binary_classify(self, binary_features):
         
         binary_logits = self.binary_classifier(binary_features)

@@ -280,9 +280,15 @@ model = model.to(DEVICE)
 # reading threasholds 
 with open(THRESHOLD_PATH) as f:
     data = json.load(f)
-    print('reading thresholds from 72th epoch, as it gave the best val mcc')
-    threshold_binary = data[71]['thresholds']['binary']
-    threshold_functional = data[71]['thresholds']['functional']
+    
+    best_i = 0
+    for i, e in enumerate(data):
+        if e['val_avg_func_mcc'] > data[best_i]['val_avg_func_mcc']:
+            best_i = i
+            
+  
+    threshold_binary = data[best_i]['thresholds']['binary']
+    threshold_functional = data[best_i]['thresholds']['functional']
 
 func_names = [index_endpoint[i] for i in FUNC_INDICES]
 bin_names = ["NON-FUNCTIONAL"]
